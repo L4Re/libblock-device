@@ -185,7 +185,13 @@ public:
                     inf->uuid);
 
         char buf[37];
-        info.printf("   : Type: %s\n", render_guid(e->type_guid, buf));
+        _Pragma("GCC diagnostic push");
+        _Pragma("GCC diagnostic ignored \"-Wdeprecated-declarations\"");
+        std::string pname = std::wstring_convert<std::codecvt_utf8_utf16<char16_t>, char16_t>{}
+                            .to_bytes(inf->name);
+        _Pragma("GCC diagnostic pop");
+        info.printf("   : [%s] Type: %s\n",
+                    pname.c_str(), render_guid(e->type_guid, buf));
       }
 
     auto warn = Dbg::warn();
