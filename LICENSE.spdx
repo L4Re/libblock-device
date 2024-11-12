@@ -16,8 +16,8 @@ Created: 2022-04-01T00:00:00Z
 PackageName: libblock-device
 SPDXID: SPDXRef-libblock-device
 PackageOriginator: Organization: Kernkonzept GmbH (info@kernkonzept.com)
-PackageLicenseDeclared: GPL-2.0-only WITH GCC-exception-2.0
-PackageLicenseConcluded: GPL-2.0-only WITH GCC-exception-2.0
+PackageLicenseDeclared: MIT
+PackageLicenseConcluded: MIT
 FilesAnalyzed: false
 PackageCopyrightText: NOASSERTION
 PackageDownloadLocation: NOASSERTION
