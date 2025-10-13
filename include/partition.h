@@ -39,9 +39,10 @@ struct Partition_info
 /**
  * Partition table reader for block devices.
  */
-template <typename DEV>
+template <typename DERIVED, typename DEV>
 class Partition_reader : public cxx::Ref_obj
 {
+protected:
   enum
   {
     Max_partitions = 1024  ///< Maximum number of partitions to be scanned.
@@ -50,34 +51,97 @@ class Partition_reader : public cxx::Ref_obj
 public:
   using Device_type = DEV;
 
-  Partition_reader(Device_type *dev)
+  Partition_reader(Device_type *dev, l4_uint32_t hdr_sectors)
   : _num_partitions(0),
     _dev(dev),
-    _header(2, dev, L4Re::Dma_space::Direction::From_device)
+    _header(hdr_sectors, dev, L4Re::Dma_space::Direction::From_device)
   {}
 
-  void read(Errand::Callback const &callback)
-  {
-    _num_partitions = 0;
-    _callback = callback;
+  virtual ~Partition_reader() = default;
 
-    // preparation: read the first two sectors
-    _db = _header.inout_block();
-    read_sectors(0, &Partition_reader::get_gpt);
-  }
+  virtual void read(Errand::Callback const &callback) = 0;
 
   l4_size_t table_size() const
   { return _num_partitions; }
 
-  int get_partition(l4_size_t idx, Partition_info *inf) const
+  virtual int get_partition(l4_size_t idx, Partition_info *inf) const = 0;
+
+protected:
+  void invoke_callback()
   {
-    if (idx == 0 || idx > _num_partitions)
+    assert(_callback);
+    _callback();
+    // Reset the callback to drop potential transitive self-references
+    _callback = nullptr;
+  }
+
+  void read_sectors(l4_uint64_t sector,
+                    void (DERIVED::*func)(int, l4_size_t))
+  {
+    using namespace std::placeholders;
+    auto next = std::bind(func, static_cast<DERIVED *>(this), _1, _2);
+
+    l4_addr_t vstart = reinterpret_cast<l4_addr_t>(_db.virt_addr);
+    l4_addr_t vend   = vstart + _db.num_sectors * _dev->sector_size();
+    l4_cache_inv_data(vstart, vend);
+
+    Errand::poll(10, 10000,
+                 [=]()
+                   {
+                     int ret = _dev->inout_data(
+                                 sector, _db,
+                                 [next, vstart, vend](int error, l4_size_t size)
+                                   {
+                                     l4_cache_inv_data(vstart, vend);
+                                     next(error, size);
+                                   },
+                                   L4Re::Dma_space::Direction::From_device);
+                     if (ret < 0 && ret != -L4_EBUSY)
+                       invoke_callback();
+                     return ret != -L4_EBUSY;
+                   },
+                 [=](bool ret) { if (!ret) invoke_callback(); }
+                );
+  }
+
+  l4_size_t _num_partitions;
+  Inout_block _db;
+  Device_type *_dev;
+  Inout_memory<Device_type> _header;
+  Errand::Callback _callback;
+};
+
+template <typename DEV>
+class Gpt_reader : public Partition_reader<Gpt_reader<DEV>, DEV>
+{
+  using Device_type = DEV;
+  using Base = Partition_reader<Gpt_reader<DEV>, Device_type>;
+
+public:
+  Gpt_reader(Device_type *dev)
+  : Partition_reader<Gpt_reader<Device_type>, Device_type>(dev, 2)
+  {}
+
+  void read(Errand::Callback const &callback) override
+  {
+    Base::_num_partitions = 0;
+    Base::_callback = callback;
+
+    // preparation: read the first two sectors
+    Base::_db = Base::_header.inout_block();
+    Base::read_sectors(0, &Gpt_reader<Device_type>::get_gpt);
+  }
+
+  int get_partition(l4_size_t idx, Partition_info *inf) const override
+  {
+    if (idx == 0 || idx > Base::_num_partitions)
       return -L4_ERANGE;
 
-    unsigned secsz = _dev->sector_size();
-    auto *header = _header.template get<Gpt::Header const>(secsz);
+    unsigned secsz = Base::_dev->sector_size();
+    auto *header = Base::_header.template get<Gpt::Header const>(secsz);
 
-    Gpt::Entry *e = _parray.template get<Gpt::Entry>((idx - 1) * header->entry_size);
+    Gpt::Entry *e =
+      _parray.template get<Gpt::Entry>((idx - 1) * header->entry_size);
 
     if (*((l4_uint64_t *) &e->partition_guid) == 0ULL)
       return -L4_ENODEV;
@@ -119,28 +183,20 @@ public:
   }
 
 private:
-  void invoke_callback()
-  {
-    assert(_callback);
-    _callback();
-    // Reset the callback to drop potential transitive self-references
-    _callback = nullptr;
-  }
-
   void get_gpt(int error, l4_size_t)
   {
-    _header.unmap();
+    Base::_header.unmap();
 
     if (error < 0)
       {
         // can't read from device, we are done
-        invoke_callback();
+        Base::invoke_callback();
         return;
       }
 
     // prepare reading of the table from disk
-    unsigned secsz = _dev->sector_size();
-    auto *header = _header.template get<Gpt::Header const>(secsz);
+    unsigned secsz = Base::_dev->sector_size();
+    auto *header = Base::_header.template get<Gpt::Header const>(secsz);
 
     auto info = Dbg::info();
     auto trace = Dbg::trace();
@@ -148,7 +204,7 @@ private:
     if (strncmp(header->signature, "EFI PART", 8) != 0)
       {
         info.printf("No GUID partition header found.\n");
-        invoke_callback();
+        Base::invoke_callback();
         return;
       }
 
@@ -170,19 +226,20 @@ private:
     info.printf("GUID partition header found with %d partitions.\n",
                 header->partition_array_size);
 
-    _num_partitions = cxx::min<l4_uint32_t>(header->partition_array_size,
-                                            Max_partitions);
+    Base::_num_partitions =
+      cxx::min<l4_uint32_t>(header->partition_array_size, Base::Max_partitions);
 
-    l4_size_t arraysz = _num_partitions * header->entry_size;
+    l4_size_t arraysz = Base::_num_partitions * header->entry_size;
     l4_size_t numsec = (arraysz - 1 + secsz) / secsz;
 
-    _parray = Inout_memory<Device_type>(numsec, _dev, L4Re::Dma_space::Direction::From_device);
+    _parray =
+      Inout_memory<Device_type>(numsec, Base::_dev,
+                                L4Re::Dma_space::Direction::From_device);
     trace.printf("Reading GPT table @ 0x%p\n", _parray.template get<void>(0));
 
-    _db = _parray.inout_block();
-    read_sectors(header->partition_array_lba, &Partition_reader::done_gpt);
+    Base::_db = _parray.inout_block();
+    Base::read_sectors(header->partition_array_lba, &Gpt_reader<DEV>::done_gpt);
   }
-
 
   void done_gpt(int error, l4_size_t)
   {
@@ -191,38 +248,9 @@ private:
     // XXX check CRC32 of table
 
     if (error < 0)
-      _num_partitions = 0;
+      Base::_num_partitions = 0;
 
-    invoke_callback();
-  }
-
-  void read_sectors(l4_uint64_t sector,
-                    void (Partition_reader::*func)(int, l4_size_t))
-  {
-    using namespace std::placeholders;
-    auto next = std::bind(func, this, _1, _2);
-
-    l4_addr_t vstart = (l4_addr_t)_db.virt_addr;
-    l4_addr_t vend   = vstart + _db.num_sectors * _dev->sector_size();
-    l4_cache_inv_data(vstart, vend);
-
-    Errand::poll(10, 10000,
-                 [=]()
-                   {
-                     int ret = _dev->inout_data(
-                                 sector, _db,
-                                 [next, vstart, vend](int error, l4_size_t size)
-                                   {
-                                     l4_cache_inv_data(vstart, vend);
-                                     next(error, size);
-                                   },
-                                   L4Re::Dma_space::Direction::From_device);
-                     if (ret < 0 && ret != -L4_EBUSY)
-                       invoke_callback();
-                     return ret != -L4_EBUSY;
-                   },
-                 [=](bool ret) { if (!ret) invoke_callback(); }
-                );
+    Base::invoke_callback();
   }
 
   static char const *render_guid(void const *guid_p, char buf[])
@@ -236,14 +264,7 @@ private:
     return buf;
   }
 
-  l4_size_t _num_partitions;
-  Inout_block _db;
-  Device_type *_dev;
-  Inout_memory<Device_type> _header;
   Inout_memory<Device_type> _parray;
-  Errand::Callback _callback;
 };
-
-
 
 }
