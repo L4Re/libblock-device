@@ -1,6 +1,7 @@
 /*
- * Copyright (C) 2018, 2020-2024 Kernkonzept GmbH.
+ * Copyright (C) 2018, 2020-2025 Kernkonzept GmbH.
  * Author(s): Sarah Hoffmann <sarah.hoffmann@kernkonzept.com>
+ *            Jakub Jermar <jakub.jermar@kernkonzept.com>
  *
  * License: see LICENSE.spdx (in this directory or the directories above)
  */
@@ -18,6 +19,7 @@
 #include <l4/libblock-device/errand.h>
 #include <l4/libblock-device/inout_memory.h>
 #include <l4/libblock-device/gpt.h>
+#include <l4/libblock-device/mbr.h>
 
 #include <l4/sys/cache.h>
 
@@ -265,6 +267,179 @@ private:
   }
 
   Inout_memory<Device_type> _parray;
+};
+
+template <typename DEV>
+class Mbr_reader : public Partition_reader<Mbr_reader<DEV>, DEV>
+{
+  using Device_type = DEV;
+  using Base = Partition_reader<Mbr_reader<DEV>, Device_type>;
+
+  enum : unsigned
+  {
+    // Limit the number of MBR partitions to 255 so that they all can have
+    // a unique UUID.
+    Max_partitions = cxx::min<unsigned>(Base::Max_partitions, 255u)
+  };
+
+public:
+  Mbr_reader(Device_type *dev)
+  : Partition_reader<Mbr_reader<Device_type>, Device_type>(dev, 1),
+    _mbr(nullptr),
+    _partitions(Mbr::Primary_partitions),
+    _extended(nullptr),
+    _lba_offset_ext(0)
+  {}
+
+  void read(Errand::Callback const &callback) override
+  {
+    Base::_num_partitions = 0;
+    Base::_callback = callback;
+
+    // preparation: read the first sector
+    Base::_db = Base::_header.inout_block();
+    Base::read_sectors(0, &Mbr_reader<DEV>::get_mbr);
+  }
+
+  int get_partition(l4_size_t idx, Partition_info *inf) const override
+  {
+    if (idx == 0 || idx > Base::_num_partitions)
+      return -L4_ERANGE;
+
+    *inf = _partitions[idx - 1];
+
+    if (inf->first > inf->last)
+      return -L4_ENODEV;
+
+    return L4_EOK;
+  }
+
+private:
+  bool register_mbr_partition(Mbr::Entry const *p, l4_uint32_t disk_id,
+                              unsigned n)
+  {
+    _partitions.resize(n + 1);
+
+    auto info = Dbg::info();
+
+    bool valid = false;
+    if (p->type && p->lba_start <= p->lba_start + p->lba_num - 1)
+      {
+        valid = true;
+        snprintf(_partitions[n].guid, sizeof(_partitions[n].guid), "%08X-%02X",
+                 disk_id, n + 1);
+        _partitions[n].first = _lba_offset_ext + p->lba_start;
+        _partitions[n].last = _lba_offset_ext + p->lba_start + p->lba_num - 1;
+        _partitions[n].flags = p->type;
+
+        info.printf("Partition %u, UUID=%s: start=%llu size=%zu, type=%x\n",
+                    n + 1, _partitions[n].guid, _partitions[n].first,
+                    p->lba_num * Base::_dev->sector_size(), p->type);
+
+        if (p->type == Mbr::Partition_type::Extended && !_extended)
+          _extended = p;
+      }
+    else
+      {
+        _partitions[n].guid[0] = 0;
+        _partitions[n].first = -1ULL;
+        _partitions[n].last = 0ULL;
+        _partitions[n].flags = 0ULL;
+      }
+
+    return valid;
+  }
+
+  void get_mbr(int error, l4_size_t)
+  {
+    Base::_header.unmap();
+
+    if (error < 0)
+      {
+        // can't read from device, we are done
+        Base::invoke_callback();
+        return;
+      }
+
+    _mbr = Base::_header.template get<Mbr::Mbr const>(0);
+
+    auto info = Dbg::info();
+
+    if (_mbr->signature[0] != Mbr::Magic_lo
+        || _mbr->signature[1] != Mbr::Magic_hi)
+      {
+        info.printf("No MBR found.\n");
+        Base::invoke_callback();
+        return;
+      }
+
+    info.printf("MBR found.\n");
+
+    for (unsigned i = 0; i < Mbr::Primary_partitions; i++)
+      (void)register_mbr_partition(&_mbr->partition[i], _mbr->disk_id, i);
+
+    Base::_num_partitions = Mbr::Primary_partitions;
+    if (_extended)
+      {
+        _ep =
+          Inout_memory<Device_type>(1, Base::_dev,
+                                    L4Re::Dma_space::Direction::From_device);
+        Base::_db = _ep.inout_block();
+        _lba_offset_ext += _extended->lba_start;
+        Base::read_sectors(_extended->lba_start, &Mbr_reader<DEV>::get_ext);
+      }
+    else
+      Base::invoke_callback();
+  }
+
+  void get_ext(int error, l4_size_t)
+  {
+    _ep.unmap();
+
+    if (error < 0)
+      {
+        // can't read from device, we are done
+        Base::invoke_callback();
+        return;
+      }
+
+    auto *ext = _ep.template get<Mbr::Mbr const>(0);
+
+    auto info = Dbg::info();
+    if (ext->signature[0] != Mbr::Magic_lo
+        || ext->signature[1] != Mbr::Magic_hi)
+      {
+        info.printf("No extended MBR found.\n");
+        Base::invoke_callback();
+        return;
+      }
+
+    info.printf("Extended MBR found at LBA %u.\n", _lba_offset_ext);
+
+    if (register_mbr_partition(&ext->partition[0], _mbr->disk_id,
+                               Base::_num_partitions))
+      {
+        Base::_num_partitions++;
+        l4_uint32_t next = ext->partition[1].lba_start;
+        if (next && Base::_num_partitions < Max_partitions)
+          {
+            _ep = Inout_memory<Device_type>(
+              1, Base::_dev, L4Re::Dma_space::Direction::From_device);
+            Base::_db = _ep.inout_block();
+            _lba_offset_ext = _extended->lba_start + next;
+            Base::read_sectors(_extended->lba_start + next,
+                               &Mbr_reader<Device_type>::get_ext);
+            return;
+          }
+      }
+    Base::invoke_callback();
+  }
+
+  Mbr::Mbr const *_mbr;
+  std::vector<Partition_info> _partitions;
+  Mbr::Entry const *_extended; // Pointer to the first extended MBR
+  Inout_memory<Device_type> _ep;
+  l4_uint32_t _lba_offset_ext; // Extended partition offset
 };
 
 }
