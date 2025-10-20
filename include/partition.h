@@ -37,12 +37,24 @@ struct Partition_info
   l4_uint64_t    flags;     ///< Additional flags, depending on partition type.
 };
 
+/**
+ * Interface of a partition table reader for block devices.
+ */
+class Reader : public cxx::Ref_obj
+{
+public:
+  virtual ~Reader() = default;
+
+  virtual void read(Errand::Callback const &callback) = 0;
+  virtual l4_size_t table_size() const = 0;
+  virtual int get_partition(l4_size_t idx, Partition_info *inf) const = 0;
+};
 
 /**
- * Partition table reader for block devices.
+ * Class providing common functionality for partition table readers.
  */
 template <typename DERIVED, typename DEV>
-class Partition_reader : public cxx::Ref_obj
+class Base_reader : public Reader
 {
 protected:
   enum
@@ -53,20 +65,9 @@ protected:
 public:
   using Device_type = DEV;
 
-  Partition_reader(Device_type *dev, l4_uint32_t hdr_sectors)
-  : _num_partitions(0),
-    _dev(dev),
-    _header(hdr_sectors, dev, L4Re::Dma_space::Direction::From_device)
+  Base_reader(Device_type *dev)
+  : _dev(dev)
   {}
-
-  virtual ~Partition_reader() = default;
-
-  virtual void read(Errand::Callback const &callback) = 0;
-
-  l4_size_t table_size() const
-  { return _num_partitions; }
-
-  virtual int get_partition(l4_size_t idx, Partition_info *inf) const = 0;
 
 protected:
   void invoke_callback()
@@ -106,41 +107,46 @@ protected:
                 );
   }
 
-  l4_size_t _num_partitions;
   Inout_block _db;
   Device_type *_dev;
-  Inout_memory<Device_type> _header;
   Errand::Callback _callback;
 };
 
+/**
+ * GPT partition table reader.
+ */
 template <typename DEV>
-class Gpt_reader : public Partition_reader<Gpt_reader<DEV>, DEV>
+class Gpt_reader : public Base_reader<Gpt_reader<DEV>, DEV>
 {
   using Device_type = DEV;
-  using Base = Partition_reader<Gpt_reader<DEV>, Device_type>;
+  using Base = Base_reader<Gpt_reader<DEV>, Device_type>;
 
 public:
   Gpt_reader(Device_type *dev)
-  : Partition_reader<Gpt_reader<Device_type>, Device_type>(dev, 2)
+  : Base_reader<Gpt_reader<Device_type>, Device_type>(dev),
+    _header(2, dev, L4Re::Dma_space::Direction::From_device)
   {}
+
+  l4_size_t table_size() const override
+  { return _num_partitions; }
 
   void read(Errand::Callback const &callback) override
   {
-    Base::_num_partitions = 0;
+    _num_partitions = 0;
     Base::_callback = callback;
 
     // preparation: read the first two sectors
-    Base::_db = Base::_header.inout_block();
+    Base::_db = _header.inout_block();
     Base::read_sectors(0, &Gpt_reader<Device_type>::get_gpt);
   }
 
   int get_partition(l4_size_t idx, Partition_info *inf) const override
   {
-    if (idx == 0 || idx > Base::_num_partitions)
+    if (idx == 0 || idx > _num_partitions)
       return -L4_ERANGE;
 
     unsigned secsz = Base::_dev->sector_size();
-    auto *header = Base::_header.template get<Gpt::Header const>(secsz);
+    auto *header = _header.template get<Gpt::Header const>(secsz);
 
     Gpt::Entry *e =
       _parray.template get<Gpt::Entry>((idx - 1) * header->entry_size);
@@ -187,7 +193,7 @@ public:
 private:
   void get_gpt(int error, l4_size_t)
   {
-    Base::_header.unmap();
+    _header.unmap();
 
     if (error < 0)
       {
@@ -198,7 +204,7 @@ private:
 
     // prepare reading of the table from disk
     unsigned secsz = Base::_dev->sector_size();
-    auto *header = Base::_header.template get<Gpt::Header const>(secsz);
+    auto *header = _header.template get<Gpt::Header const>(secsz);
 
     auto info = Dbg::info();
     auto trace = Dbg::trace();
@@ -228,10 +234,10 @@ private:
     info.printf("GUID partition header found with %d partitions.\n",
                 header->partition_array_size);
 
-    Base::_num_partitions =
+    _num_partitions =
       cxx::min<l4_uint32_t>(header->partition_array_size, Base::Max_partitions);
 
-    l4_size_t arraysz = Base::_num_partitions * header->entry_size;
+    l4_size_t arraysz = _num_partitions * header->entry_size;
     l4_size_t numsec = (arraysz - 1 + secsz) / secsz;
 
     _parray =
@@ -250,7 +256,7 @@ private:
     // XXX check CRC32 of table
 
     if (error < 0)
-      Base::_num_partitions = 0;
+      _num_partitions = 0;
 
     Base::invoke_callback();
   }
@@ -266,14 +272,21 @@ private:
     return buf;
   }
 
+  l4_size_t _num_partitions;
+  Inout_memory<Device_type> _header;
   Inout_memory<Device_type> _parray;
 };
 
+/**
+ * MBR partition table reader.
+ *
+ * Handles primary and logical partitions.
+ */
 template <typename DEV>
-class Mbr_reader : public Partition_reader<Mbr_reader<DEV>, DEV>
+class Mbr_reader : public Base_reader<Mbr_reader<DEV>, DEV>
 {
   using Device_type = DEV;
-  using Base = Partition_reader<Mbr_reader<DEV>, Device_type>;
+  using Base = Base_reader<Mbr_reader<DEV>, Device_type>;
 
   enum : unsigned
   {
@@ -284,26 +297,32 @@ class Mbr_reader : public Partition_reader<Mbr_reader<DEV>, DEV>
 
 public:
   Mbr_reader(Device_type *dev)
-  : Partition_reader<Mbr_reader<Device_type>, Device_type>(dev, 1),
+  : Base_reader<Mbr_reader<Device_type>, Device_type>(dev),
     _mbr(nullptr),
+    _header(1, dev, L4Re::Dma_space::Direction::From_device),
     _partitions(Mbr::Primary_partitions),
     _extended(nullptr),
     _lba_offset_ext(0)
   {}
 
+  l4_size_t table_size() const override
+  {
+    return _num_partitions;
+  }
+
   void read(Errand::Callback const &callback) override
   {
-    Base::_num_partitions = 0;
+    _num_partitions = 0;
     Base::_callback = callback;
 
     // preparation: read the first sector
-    Base::_db = Base::_header.inout_block();
+    Base::_db = _header.inout_block();
     Base::read_sectors(0, &Mbr_reader<DEV>::get_mbr);
   }
 
   int get_partition(l4_size_t idx, Partition_info *inf) const override
   {
-    if (idx == 0 || idx > Base::_num_partitions)
+    if (idx == 0 || idx > _num_partitions)
       return -L4_ERANGE;
 
     *inf = _partitions[idx - 1];
@@ -352,7 +371,7 @@ private:
 
   void get_mbr(int error, l4_size_t)
   {
-    Base::_header.unmap();
+    _header.unmap();
 
     if (error < 0)
       {
@@ -361,7 +380,7 @@ private:
         return;
       }
 
-    _mbr = Base::_header.template get<Mbr::Mbr const>(0);
+    _mbr = _header.template get<Mbr::Mbr const>(0);
 
     auto info = Dbg::info();
 
@@ -378,7 +397,7 @@ private:
     for (unsigned i = 0; i < Mbr::Primary_partitions; i++)
       (void)register_mbr_partition(&_mbr->partition[i], _mbr->disk_id, i);
 
-    Base::_num_partitions = Mbr::Primary_partitions;
+    _num_partitions = Mbr::Primary_partitions;
     if (_extended)
       {
         _ep =
@@ -417,11 +436,11 @@ private:
     info.printf("Extended MBR found at LBA %u.\n", _lba_offset_ext);
 
     if (register_mbr_partition(&ext->partition[0], _mbr->disk_id,
-                               Base::_num_partitions))
+                               _num_partitions))
       {
-        Base::_num_partitions++;
+        _num_partitions++;
         l4_uint32_t next = ext->partition[1].lba_start;
-        if (next && Base::_num_partitions < Max_partitions)
+        if (next && _num_partitions < Max_partitions)
           {
             _ep = Inout_memory<Device_type>(
               1, Base::_dev, L4Re::Dma_space::Direction::From_device);
@@ -435,11 +454,62 @@ private:
     Base::invoke_callback();
   }
 
+  l4_size_t _num_partitions;
   Mbr::Mbr const *_mbr;
+  Inout_memory<Device_type> _header;
   std::vector<Partition_info> _partitions;
   Mbr::Entry const *_extended; // Pointer to the first extended MBR
   Inout_memory<Device_type> _ep;
   l4_uint32_t _lba_offset_ext; // Extended partition offset
+};
+
+/// Generic partition reader which tries to read GPT first and MBR second
+/// as a fallback.
+template <typename DEV>
+class Partition_reader : public Base_reader<Partition_reader<DEV>, DEV>
+{
+  using Device_type = DEV;
+  using Base = Base_reader<Partition_reader<DEV>, Device_type>;
+
+public:
+  Partition_reader(Device_type *dev)
+  : Base_reader<Partition_reader<Device_type>, Device_type>(dev),
+    _reader(cxx::make_ref_obj<Gpt_reader<Device_type>>(dev))
+  {}
+
+  l4_size_t table_size() const override
+  {
+    return _reader->table_size();
+  }
+
+  void read(Errand::Callback const &callback) override
+  {
+    Base::_callback = callback; // hold ref to the original callback
+    _reader->read([=]()
+      {
+        // If the GPT reader fails to discover any partitions, we carefully
+        // switch to the MBR reader. When the MBR reader's callback is called
+        // we are done whether it found any partitions or not. In any case
+        // this ends by invoking the original callback.
+        if (_reader->table_size() == 0)
+          {
+            // Hold ref to the old reader as we are still executing its lambda.
+            auto old = _reader;
+            _reader = cxx::make_ref_obj<Mbr_reader<Device_type>>(Base::_dev);
+            _reader->read([=](){ Base::invoke_callback();});
+          }
+        else
+          Base::invoke_callback();
+      });
+  }
+
+  int get_partition(l4_size_t idx, Partition_info *inf) const override
+  {
+    return _reader->get_partition(idx, inf);
+  }
+
+private:
+  cxx::Ref_ptr<Reader> _reader;
 };
 
 }
