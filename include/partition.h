@@ -30,7 +30,7 @@ namespace Block_device {
  */
 struct Partition_info
 {
-  char           guid[37];  ///< ID of the partition.
+  char           uuid[37];  ///< ID of the partition.
   std::u16string name;      ///< UTF16 name of the partition.
   l4_uint64_t    first;     ///< First valid sector.
   l4_uint64_t    last;      ///< Last valid sector.
@@ -148,7 +148,7 @@ public:
     if (*((l4_uint64_t *) &e->partition_guid) == 0ULL)
       return -L4_ENODEV;
 
-    render_guid(e->partition_guid, inf->guid);
+    render_guid(e->partition_guid, inf->uuid);
 
     auto name =
       std::u16string((char16_t *)e->name, sizeof(e->name) / sizeof(e->name[0]));
@@ -164,7 +164,7 @@ public:
         info.printf("%3zu: %10lld %10lld  %5gMiB [%.37s]\n",
                     idx, e->first, e->last,
                     (e->last - e->first + 1.0) * secsz / (1 << 20),
-                    inf->guid);
+                    inf->uuid);
 
         char buf[37];
         info.printf("   : Type: %s\n", render_guid(e->type_guid, buf));
@@ -326,14 +326,14 @@ private:
     if (p->type && p->lba_start <= p->lba_start + p->lba_num - 1)
       {
         valid = true;
-        snprintf(_partitions[n].guid, sizeof(_partitions[n].guid), "%08X-%02X",
+        snprintf(_partitions[n].uuid, sizeof(_partitions[n].uuid), "%08X-%02X",
                  disk_id, n + 1);
         _partitions[n].first = _lba_offset_ext + p->lba_start;
         _partitions[n].last = _lba_offset_ext + p->lba_start + p->lba_num - 1;
         _partitions[n].flags = p->type;
 
         info.printf("Partition %u, UUID=%s: start=%llu size=%zu, type=%x\n",
-                    n + 1, _partitions[n].guid, _partitions[n].first,
+                    n + 1, _partitions[n].uuid, _partitions[n].first,
                     p->lba_num * Base::_dev->sector_size(), p->type);
 
         if (p->type == Mbr::Partition_type::Extended && !_extended)
@@ -341,7 +341,7 @@ private:
       }
     else
       {
-        _partitions[n].guid[0] = 0;
+        _partitions[n].uuid[0] = 0;
         _partitions[n].first = -1ULL;
         _partitions[n].last = 0ULL;
         _partitions[n].flags = 0ULL;

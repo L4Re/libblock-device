@@ -553,6 +553,11 @@ private:
 
   static constexpr bool is_uuid(char const *s)
   {
+    return is_guid(s) || is_mbr_uuid(s);
+  }
+
+  static constexpr bool is_guid(char const *s)
+  {
     for (unsigned i = 0; i < 36; ++i)
       if (i == 8 || i == 13 || i == 18 || i == 23)
         {
@@ -565,6 +570,22 @@ private:
             return false;
         }
     return s[36] == '\0';
+  }
+
+  static constexpr bool is_mbr_uuid(char const *s)
+  {
+    for (unsigned i = 0; i < 11; ++i)
+      if (i == 8)
+        {
+          if (s[i] != '-')
+            return false;
+        }
+      else
+        {
+          if (!isxdigit(s[i]))
+            return false;
+        }
+    return s[11] == '\0';
   }
 
   /// Registry new client connections subscribe to.

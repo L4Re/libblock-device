@@ -111,8 +111,8 @@ public:
 
     snprintf(_partition_id, sizeof(_partition_id), "%d", partition_id);
 
-    static_assert(sizeof(_guid) == sizeof(pi.guid), "String size mismatch");
-    memcpy(_guid, pi.guid, sizeof(_guid));
+    static_assert(sizeof(_uuid) == sizeof(pi.uuid), "String size mismatch");
+    memcpy(_uuid, pi.uuid, sizeof(_uuid));
   }
 
   Notification_domain const *notification_domain() const override
@@ -123,7 +123,7 @@ public:
 
   bool match_hid(cxx::String const &hid) const override
   {
-    if (hid == cxx::String(_guid, 36))
+    if (hid == cxx::String(_uuid, cxx::min(strlen(_uuid), sizeof(_uuid) - 1)))
       return true;
 
     _Pragma("GCC diagnostic push");
@@ -210,7 +210,7 @@ public:
 
 
 private:
-  char _guid[37];
+  char _uuid[37];
   std::u16string  _name;
   char _partition_id[4];
   cxx::Ref_ptr<Device_type> _parent;
