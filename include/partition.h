@@ -9,7 +9,10 @@
 
 #include <cstring>
 #include <string>
+#include <locale>
+#include <codecvt>
 #include <cassert>
+#include <map>
 
 #include <l4/cxx/ref_ptr>
 
@@ -25,11 +28,18 @@
 
 namespace Block_device {
 
+enum Partition_type
+{
+  Gpt_part = 1,
+  Mbr_part = 2
+};
+
 /**
  * Information about a single partition.
  */
 struct Partition_info
 {
+  Partition_type type;      ///< What kind of partition table scheme is used
   char           uuid[37];  ///< ID of the partition.
   std::u16string name;      ///< UTF16 name of the partition.
   l4_uint64_t    first;     ///< First valid sector.
@@ -161,6 +171,7 @@ public:
       std::u16string((char16_t *)e->name, sizeof(e->name) / sizeof(e->name[0]));
     inf->name = name.substr(0, name.find((char16_t) 0));
 
+    inf->type = Gpt_part;
     inf->first = e->first;
     inf->last = e->last;
     inf->flags = e->flags;
@@ -282,12 +293,25 @@ private:
  * MBR partition table reader.
  *
  * Handles primary and logical partitions.
+ *
+ * \tparam DEV      The underlying device type.
+ * \tparam DERIVED  Name of the derived class to be passed to Base_reader. It
+ *                  must be provided if the derived class wants to provide its
+ *                  own callbacks for Base_reader::read_sectors(). By default
+ *                  this is void and results in Mbr_reader itself being used as
+ *                  the derived class for Base_reader.
  */
-template <typename DEV>
-class Mbr_reader : public Base_reader<Mbr_reader<DEV>, DEV>
+template <typename DEV, typename DERIVED = void>
+class Mbr_reader
+: public Base_reader<typename std::conditional<std::is_class<DERIVED>::value,
+                                               DERIVED, Mbr_reader<DEV>>::type,
+                     DEV>
 {
   using Device_type = DEV;
-  using Base = Base_reader<Mbr_reader<DEV>, Device_type>;
+  using Derived_type =
+    typename std::conditional<std::is_class<DERIVED>::value, DERIVED,
+                              Mbr_reader<DEV>>::type;
+  using Base = Base_reader<Derived_type, Device_type>;
 
   enum : unsigned
   {
@@ -298,7 +322,7 @@ class Mbr_reader : public Base_reader<Mbr_reader<DEV>, DEV>
 
 public:
   Mbr_reader(Device_type *dev)
-  : Base_reader<Mbr_reader<Device_type>, Device_type>(dev),
+  : Base(dev),
     _mbr(nullptr),
     _header(1, dev, L4Re::Dma_space::Direction::From_device),
     _partitions(Mbr::Primary_partitions),
@@ -318,7 +342,7 @@ public:
 
     // preparation: read the first sector
     Base::_db = _header.inout_block();
-    Base::read_sectors(0, &Mbr_reader<DEV>::get_mbr);
+    Base::read_sectors(0, &Derived_type::get_mbr);
   }
 
   int get_partition(l4_size_t idx, Partition_info *inf) const override
@@ -348,6 +372,7 @@ private:
         valid = true;
         snprintf(_partitions[n].uuid, sizeof(_partitions[n].uuid), "%08X-%02X",
                  disk_id, n + 1);
+        _partitions[n].type = Mbr_part;
         _partitions[n].first = _lba_offset_ext + p->lba_start;
         _partitions[n].last = _lba_offset_ext + p->lba_start + p->lba_num - 1;
         _partitions[n].flags = p->type;
@@ -361,6 +386,7 @@ private:
       }
     else
       {
+        _partitions[n].type = Mbr_part;
         _partitions[n].uuid[0] = 0;
         _partitions[n].first = -1ULL;
         _partitions[n].last = 0ULL;
@@ -406,7 +432,7 @@ private:
                                     L4Re::Dma_space::Direction::From_device);
         Base::_db = _ep.inout_block();
         _lba_offset_ext += _extended->lba_start;
-        Base::read_sectors(_extended->lba_start, &Mbr_reader<DEV>::get_ext);
+        Base::read_sectors(_extended->lba_start, &Derived_type::get_ext);
       }
     else
       Base::invoke_callback();
@@ -448,7 +474,7 @@ private:
             Base::_db = _ep.inout_block();
             _lba_offset_ext = _extended->lba_start + next;
             Base::read_sectors(_extended->lba_start + next,
-                               &Mbr_reader<Device_type>::get_ext);
+                               &Derived_type::get_ext);
             return;
           }
       }
@@ -464,8 +490,159 @@ private:
   l4_uint32_t _lba_offset_ext; // Extended partition offset
 };
 
-/// Generic partition reader which tries to read GPT first and MBR second
-/// as a fallback.
+/**
+ * Labeling reader works on top of another partition reader by decorating its
+ * partition info by file system labels found in the filesystems on the detected
+ * partitions.
+ *
+ * This functionality is currently limited to Linux type (i.e. 0x83) MBR
+ * partitions with Ext2-compatible file system on them.
+ *
+ * \tparam DEV   The underlying device type.
+ * \tparam BASE  The backend partition reader.
+ */
+template <typename DEV, typename BASE>
+class Labeling_reader : public BASE
+{
+  using Device_type = DEV;
+  using Base = BASE;
+
+public:
+  Labeling_reader(Device_type *dev) : Base(dev), _cur(0)
+  {}
+
+  void read(Errand::Callback const &callback) override
+  {
+    Base::read([=](){ label(callback); });
+  }
+
+  int get_partition(l4_size_t idx, Partition_info *inf) const override
+  {
+    int ret = Base::get_partition(idx, inf);
+    if (ret == L4_EOK)
+      {
+        if (inf->name.empty())
+          {
+            auto it = _labels.find(idx);
+            if (it != _labels.end())
+              {
+                _Pragma("GCC diagnostic push");
+                _Pragma("GCC diagnostic ignored \"-Wdeprecated-declarations\"");
+                inf->name =
+                  std::wstring_convert<std::codecvt_utf8_utf16<char16_t>,
+                                       char16_t>{}
+                    .from_bytes(it->second);
+                _Pragma("GCC diagnostic pop");
+              }
+          }
+      }
+    return ret;
+  }
+
+private:
+  bool next(Partition_info *info)
+  {
+    for (; _cur < Base::table_size(); _cur++)
+      {
+        if (Base::get_partition(_cur + 1, info) == L4_EOK)
+          {
+            if (info->type == Mbr_part
+                && info->flags == Mbr::Partition_type::Linux)
+              {
+                return true;
+              }
+          }
+      }
+    return false;
+  }
+
+  void label(Errand::Callback const &callback)
+  {
+    Base::_callback = callback;
+    Partition_info inf;
+    if (!next(&inf))
+      {
+        Base::invoke_callback();
+        return;
+      }
+    _sb = Inout_memory<Device_type>(1, Base::_dev,
+                                    L4Re::Dma_space::Direction::From_device);
+    Base::_db = _sb.inout_block();
+    Base::read_sectors(
+      inf.first + (Ext2::Superblock_offset / Base::_dev->sector_size()),
+      &Labeling_reader<Device_type, Base>::get_label);
+  }
+
+  void get_label(int error, l4_size_t)
+  {
+    _sb.unmap();
+
+    if (error < 0)
+      {
+        // can't read from device, we are done
+        Base::invoke_callback();
+        return;
+      }
+
+    Partition_info inf;
+
+    auto *sb = _sb.template get<Ext2::Superblock const>(
+      Ext2::Superblock_offset % Base::_dev->sector_size());
+
+    auto info = Dbg::info();
+    if (sb->magic == Ext2::Superblock_magic
+        && sb->major >= Ext2::Superblock_version)
+      {
+        std::string label = std::string(
+          reinterpret_cast<const char *>(sb->name),
+          cxx::min(strlen(reinterpret_cast<const char *>(sb->name)),
+                   sizeof(sb->name)));
+        label.erase(0, label.find_first_not_of(" "));
+        label.erase(label.find_last_not_of(" ") + 1);
+        info.printf("Found Ext2 superblock on partition %u, label=%s\n",
+                    _cur + 1, label.c_str());
+        _labels[_cur + 1] = label;
+      }
+    else
+      info.printf("No label found for partition %u.\n", _cur + 1);
+
+    _cur++;
+    if (!next(&inf))
+      {
+        Base::invoke_callback();
+        return;
+      }
+
+    _sb = Inout_memory<Device_type>(1, Base::_dev,
+                                    L4Re::Dma_space::Direction::From_device);
+    Base::_db = _sb.inout_block();
+    Base::read_sectors(
+      inf.first + (Ext2::Superblock_offset / Base::_dev->sector_size()),
+      &Labeling_reader<Device_type, Base>::get_label);
+  }
+
+  unsigned _cur;
+  std::map<unsigned, std::string> _labels;
+  Inout_memory<Device_type> _sb;
+};
+
+/**
+ * Helper class that combines the Labeling reader with the MBR reader.
+ */
+template <typename DEV>
+class Labeling_mbr_reader
+: public Labeling_reader<DEV, Mbr_reader<DEV, Labeling_mbr_reader<DEV>>>
+{
+public:
+  Labeling_mbr_reader(DEV *dev)
+  : Labeling_reader<DEV, Mbr_reader<DEV, Labeling_mbr_reader<DEV>>>(dev)
+  {}
+};
+
+/**
+ * Generic partition reader which tries to read GPT first and MBR second
+ * as a fallback.
+ */
 template <typename DEV>
 class Partition_reader : public Base_reader<Partition_reader<DEV>, DEV>
 {
@@ -496,7 +673,8 @@ public:
           {
             // Hold ref to the old reader as we are still executing its lambda.
             auto old = _reader;
-            _reader = cxx::make_ref_obj<Mbr_reader<Device_type>>(Base::_dev);
+            _reader =
+              cxx::make_ref_obj<Labeling_mbr_reader<Device_type>>(Base::_dev);
             _reader->read([=](){ Base::invoke_callback();});
           }
         else

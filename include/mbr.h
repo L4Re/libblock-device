@@ -24,7 +24,8 @@ enum
 
 enum Partition_type
 {
-  Extended = 0x5
+  Extended = 0x5,
+  Linux = 0x83
 };
 
 struct Entry
@@ -47,4 +48,28 @@ struct Mbr
 } __attribute__((packed));
 
 } // namespace
+
+namespace Ext2 {
+
+enum
+{
+  Superblock_offset = 1024,
+  Superblock_magic = 0xef53,
+  Superblock_version = 1,
+};
+
+// Ext2 superblock with fields essential for getting the "label".
+struct Superblock
+{
+  l4_uint8_t ignore[56];
+  l4_uint16_t magic;
+  l4_uint8_t ignore2[18];
+  l4_uint32_t major;
+  l4_uint8_t ignore3[24];
+  l4_uint8_t fs_id[16];
+  l4_uint8_t name[16];
+} __attribute__((packed));
+
+} // namespace
+
 } // namespace
