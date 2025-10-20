@@ -73,9 +73,10 @@ protected:
   void invoke_callback()
   {
     assert(_callback);
-    _callback();
+    auto cb = _callback;
     // Reset the callback to drop potential transitive self-references
     _callback = nullptr;
+    cb();
   }
 
   void read_sectors(l4_uint64_t sector,
