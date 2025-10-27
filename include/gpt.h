@@ -40,17 +40,4 @@ struct Entry
 };
 
 } // namespace
-
-namespace Pc_partition_table {
-
-struct Part_table {
-  l4_uint8_t    bootable;
-  l4_uint8_t    first_sector_chs[3];
-  l4_uint8_t    type;
-  l4_uint8_t    last_sector_chs[3];
-  l4_uint32_t   start_sector_lba;
-  l4_uint32_t   num_sector_lba;
-} __attribute__((packed));
-
-} // namespace
 } // namespace
