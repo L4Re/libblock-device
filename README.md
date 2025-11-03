@@ -1,4 +1,4 @@
-# L4Re block device library
+# L4Re Block Device Library
 
 libblock-device is a library used by block device servers. It takes
 care of processing requests from L4virtio block clients, queuing them and
@@ -13,15 +13,14 @@ device implementations.
 # Documentation
 
 This package is part of the L4Re operating system. For documentation and
-build instructions see the
-[L4Re wiki](https://kernkonzept.com/L4Re/guides/l4re).
+build instructions please refer to [l4re.org](https://l4re.org).
 
 # Contributions
 
-We welcome contributions. Please see our contributors guide on
-[how to contribute](https://kernkonzept.com/L4Re/contributing/l4re).
+We welcome contributions. Please see the
+[contributors guide](https://l4re.org/contributing/).
 
 # License
 
-Detailed licensing and copyright information can be found in
-the [LICENSE](LICENSE.spdx) file.
+Detailed licensing and copyright information can be found in the
+[LICENSE](LICENSE.spdx) file.
