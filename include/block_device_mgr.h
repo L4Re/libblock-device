@@ -135,7 +135,7 @@ class Device_mgr
     void start_disk_scan(Errand::Callback const &callback)
     {
       _device->start_device_scan(
-        [=]()
+        [this, callback]()
           {
             scan_disk_partitions(callback, 0);
           });
@@ -254,7 +254,7 @@ class Device_mgr
       // reader's own read() method. At the same time, reader will store
       // the reference to the lambda.
       reader->read(
-        [=]()
+        [this, callback, reader]()
           {
             l4_size_t sz = reader->table_size();
 
@@ -509,7 +509,7 @@ public:
     auto conn = cxx::make_ref_obj<Connection>(this, std::move(device));
 
     conn->start_disk_scan(
-      [=]()
+      [this, conn, callback]()
         {
           _connpts.push_front(conn);
           connect_static_clients(conn.get());

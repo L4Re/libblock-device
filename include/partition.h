@@ -100,7 +100,7 @@ protected:
     l4_cache_inv_data(vstart, vend);
 
     Errand::poll(10, 10000,
-                 [=]()
+                 [this, sector, next, vstart, vend]()
                    {
                      int ret = _dev->inout_data(
                                  sector, _db,
@@ -114,7 +114,7 @@ protected:
                        invoke_callback();
                      return ret != -L4_EBUSY;
                    },
-                 [=](bool ret) { if (!ret) invoke_callback(); }
+                 [this](bool ret) { if (!ret) invoke_callback(); }
                 );
   }
 
@@ -519,7 +519,7 @@ public:
 
   void read(Errand::Callback const &callback) override
   {
-    Base::read([=](){ label(callback); });
+    Base::read([this, callback](){ label(callback); });
   }
 
   int get_partition(l4_size_t idx, Partition_info *inf) const override
@@ -669,7 +669,7 @@ public:
   void read(Errand::Callback const &callback) override
   {
     Base::_callback = callback; // hold ref to the original callback
-    _reader->read([=]()
+    _reader->read([this]()
       {
         // If the GPT reader fails to discover any partitions, we carefully
         // switch to the MBR reader. When the MBR reader's callback is called
@@ -681,7 +681,7 @@ public:
             auto old = _reader;
             _reader =
               cxx::make_ref_obj<Labeling_mbr_reader<Device_type>>(Base::_dev);
-            _reader->read([=](){ Base::invoke_callback();});
+            _reader->read([this](){ Base::invoke_callback();});
           }
         else
           Base::invoke_callback();
