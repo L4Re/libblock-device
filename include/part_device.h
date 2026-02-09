@@ -85,7 +85,7 @@ namespace Impl {
  *
  * \tparam  BASE_DEV  Class defining the device interface.
  *                    Attention: this is not the class implementing the
- *                    device iteself.
+ *                    device itself.
  */
 template <typename BASE_DEV = Device>
 class Partitioned_device
