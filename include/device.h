@@ -52,6 +52,9 @@ struct Device : public cxx::Ref_obj
   virtual l4_size_t max_size() const = 0;
   /// Returns the number of segments allowed for scatter-gather-operations.
   virtual unsigned max_segments() const = 0;
+  /// Returns true if the device has a cache that benefits from explicit flush.
+  /// Default is true for backward compatibility.
+  virtual bool supports_flush() const { return true; }
 
   /// Resets the device into a good known state.
   virtual void reset() = 0;
